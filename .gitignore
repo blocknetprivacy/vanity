@@ -1,0 +1,30 @@
+# Rust / Cargo
+target/
+Cargo.lock
+
+# Binary
+blocknet-vanity
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Emacs
+flycheck_*.el
+flycheck*.elc
+.dir-locals.el
+
+# Make
+*.o
+*.a
