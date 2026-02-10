@@ -55,7 +55,6 @@ cargo build --release
 --prefix <str>      prefix the address must start with (case-insensitive)
 --suffix <str>      suffix the address must end with (case-insensitive)
 -t, --threads <N>   number of worker threads (default: CPU core count)
--o, --output <dir>  directory to save wallet JSON files (default: .)
 ```
 
 At least one of `--prefix` or `--suffix` is required. Both can be combined. Patterns are limited to 8 characters and must only contain valid base58 characters (no `0`, `O`, `I`, `l`).
@@ -65,12 +64,12 @@ At least one of `--prefix` or `--suffix` is required. Both can be combined. Patt
 ```
 ./blocknet-vanity --prefix dead
 ./blocknet-vanity --suffix cat
-./blocknet-vanity --prefix ab --suffix cd -t 8 -o wallets/
+./blocknet-vanity --prefix ab --suffix cd -t 8
 ```
 
 ### output
 
-Found wallets are saved as JSON files named after their address:
+Found wallets are saved in ./wallets/{pattern}-{prefix|suffix}/{pattern}.json
 
 ```json
 {
