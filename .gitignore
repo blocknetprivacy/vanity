@@ -28,3 +28,4 @@ flycheck*.elc
 # Make
 *.o
 *.a
+wallets

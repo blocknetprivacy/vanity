@@ -6,7 +6,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use curve25519_dalek::constants::RISTRETTO_BASEPOINT_TABLE;
+use curve25519_dalek::constants::{RISTRETTO_BASEPOINT_POINT, RISTRETTO_BASEPOINT_TABLE};
 use curve25519_dalek::scalar::Scalar;
 use rand::RngCore;
 use serde::Serialize;
@@ -30,6 +30,39 @@ fn validate_pattern(s: &str) -> Result<(), char> {
         }
     }
     Ok(())
+}
+
+#[inline]
+fn starts_with_ascii_lowered(haystack: &[u8], needle_lower: &[u8]) -> bool {
+    if needle_lower.is_empty() {
+        return true;
+    }
+    if needle_lower.len() > haystack.len() {
+        return false;
+    }
+    for (i, &b) in needle_lower.iter().enumerate() {
+        if haystack[i].to_ascii_lowercase() != b {
+            return false;
+        }
+    }
+    true
+}
+
+#[inline]
+fn ends_with_ascii_lowered(haystack: &[u8], needle_lower: &[u8]) -> bool {
+    if needle_lower.is_empty() {
+        return true;
+    }
+    if needle_lower.len() > haystack.len() {
+        return false;
+    }
+    let start = haystack.len() - needle_lower.len();
+    for (i, &b) in needle_lower.iter().enumerate() {
+        if haystack[start + i].to_ascii_lowercase() != b {
+            return false;
+        }
+    }
+    true
 }
 
 /// Blocknet vanity address generator.
@@ -225,19 +258,24 @@ fn main() {
 
             // Random starting point, then increment (avoids RNG overhead in hot loop)
             let mut spend_priv = random_scalar(&mut rng);
+            let mut spend_pub_point = &spend_priv * RISTRETTO_BASEPOINT_TABLE;
             let mut local_count: u64 = 0;
             let mut combined = [0u8; 64];
+            let mut address = String::with_capacity(96);
             combined[32..].copy_from_slice(&view_pub_bytes);
 
             loop {
-                let spend_pub = (&spend_priv * RISTRETTO_BASEPOINT_TABLE).compress();
+                let spend_pub = spend_pub_point.compress();
                 combined[..32].copy_from_slice(spend_pub.as_bytes());
 
-                let address = bs58::encode(&combined).into_string();
-                let addr_lower = address.to_ascii_lowercase();
+                address.clear();
+                bs58::encode(&combined)
+                    .onto(&mut address)
+                    .expect("encoding to string cannot fail");
 
-                let prefix_ok = prefix_lower.is_empty() || addr_lower.starts_with(&prefix_lower);
-                let suffix_ok = suffix_lower.is_empty() || addr_lower.ends_with(&suffix_lower);
+                let address_bytes = address.as_bytes();
+                let prefix_ok = starts_with_ascii_lowered(address_bytes, prefix_lower.as_bytes());
+                let suffix_ok = ends_with_ascii_lowered(address_bytes, suffix_lower.as_bytes());
 
                 if prefix_ok && suffix_ok {
                     let wallet = VanityWallet {
@@ -264,6 +302,7 @@ fn main() {
                 }
 
                 spend_priv += Scalar::ONE;
+                spend_pub_point += RISTRETTO_BASEPOINT_POINT;
                 local_count += 1;
                 if local_count & 0x3FF == 0 {
                     counter.fetch_add(1024, Ordering::Relaxed);
