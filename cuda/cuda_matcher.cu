@@ -3,7 +3,7 @@
 
 namespace {
 
-constexpr char BASE58_ALPHABET[] =
+__device__ __constant__ char BASE58_ALPHABET_DEVICE[] =
     "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
 __device__ __forceinline__ char ascii_lower(char c) {
@@ -39,7 +39,7 @@ __device__ int encode_base58_64(const uint8_t* input, char* out) {
     }
 
     for (int i = 0; i < index; ++i) {
-        out[i] = BASE58_ALPHABET[digits[index - 1 - i]];
+        out[i] = BASE58_ALPHABET_DEVICE[digits[index - 1 - i]];
     }
     return index;
 }
