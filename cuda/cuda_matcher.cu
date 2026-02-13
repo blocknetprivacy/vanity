@@ -119,6 +119,8 @@ extern "C" int cuda_match_batch(
     char* d_prefix = nullptr;
     char* d_suffix = nullptr;
     int rc = 0;
+    int threads = 256;
+    int blocks = (batch_size + threads - 1) / threads;
 
     if (cudaMalloc(&d_inputs, inputs_size) != cudaSuccess) { rc = 11; goto cleanup; }
     if (cudaMalloc(&d_flags, flags_size) != cudaSuccess) { rc = 12; goto cleanup; }
@@ -131,8 +133,6 @@ extern "C" int cuda_match_batch(
     if (suffix_len > 0 &&
         cudaMemcpy(d_suffix, suffix_lower, static_cast<size_t>(suffix_len), cudaMemcpyHostToDevice) != cudaSuccess) { rc = 23; goto cleanup; }
 
-    int threads = 256;
-    int blocks = (batch_size + threads - 1) / threads;
     match_kernel<<<blocks, threads>>>(
         d_inputs,
         batch_size,
