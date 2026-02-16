@@ -3,6 +3,10 @@
 #include <stdio.h>
 #include <string.h>
 
+// Generator multiples table: G, 2G, 4G, ..., 2^23*G  (24 entries)
+// Populated at init time from host via cuda_init_gen_table().
+#define TABLE_SIZE 24
+
 // ============================================================================
 // BIP39 PBKDF2-HMAC-SHA512 (mnemonic -> 64-byte seed)
 //
@@ -641,6 +645,9 @@ struct ge25519_p3 {
     fe25519 X, Y, Z, T;
 };
 
+// Device-side generator table used by multiple kernels, including the BIP39 path.
+__device__ ge25519_p3 d_gen_table[TABLE_SIZE];
+
 // R = P + Q (unified addition, extended coordinates)
 // Using the add-2008-hwcd formula for a=-1 twisted Edwards curves
 __device__ void ge_add(ge25519_p3* R, const ge25519_p3* P, const ge25519_p3* Q) {
@@ -1028,10 +1035,6 @@ __device__ void ge_double(ge25519_p3* R, const ge25519_p3* P) {
     fe_mul(&R->T, &E, &H);
 }
 
-// Forward declaration; defined later and filled by cuda_init_gen_table().
-// Unsized to avoid needing TABLE_SIZE at this point.
-extern __device__ ge25519_p3 d_gen_table[];
-
 __device__ void ge_scalarmult_basepoint(ge25519_p3* out, const uint8_t scalar_le[32]) {
     ge25519_p3 acc;
     ge_identity(&acc);
@@ -1389,15 +1392,10 @@ __global__ void match_kernel(
 // NEW: Full GPU vanity kernel - key generation + encoding + matching
 // ============================================================================
 
-// Generator multiples table: G, 2G, 4G, ..., 2^23*G  (24 entries)
-// Set at init time from host
-#define TABLE_SIZE 24
-
 // Each thread computes KEYS_PER_THREAD consecutive keys
 #define KEYS_PER_THREAD 8
 #define KPT_SHIFT 3  // log2(KEYS_PER_THREAD)
 
-__device__ ge25519_p3 d_gen_table[TABLE_SIZE];
 __device__ fe25519 d_view_pub_fe[1];  // not used directly, but view_pub bytes are
 
 __device__ __forceinline__ int cmp_combined_split_to_bound(
