@@ -1028,6 +1028,9 @@ __device__ void ge_double(ge25519_p3* R, const ge25519_p3* P) {
     fe_mul(&R->T, &E, &H);
 }
 
+// Forward declaration; defined later and filled by cuda_init_gen_table().
+extern __device__ ge25519_p3 d_gen_table[TABLE_SIZE];
+
 __device__ void ge_scalarmult_basepoint(ge25519_p3* out, const uint8_t scalar_le[32]) {
     ge25519_p3 acc;
     ge_identity(&acc);
