@@ -15,10 +15,15 @@ use curve25519_dalek::constants::RISTRETTO_BASEPOINT_TABLE;
 use curve25519_dalek::ristretto::RistrettoPoint;
 use curve25519_dalek::scalar::Scalar;
 use rand::RngCore;
+use sha2::{Digest, Sha512};
+use sha3::Sha3_256;
 use serde::Serialize;
 
 const BASE58_ALPHABET: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 const BASE58_CHARS: &[u8] = BASE58_ALPHABET.as_bytes();
+const BLOCKNET_NETWORK_ID: &str = "blocknet_mainnet";
+const BLOCKNET_ADDR_CHECKSUM_TAG: &str = "blocknet_stealth_address_checksum";
+const BLOCKNET_KEYGEN_TAG: &[u8] = b"blocknet_keygen";
 
 /// Maximum number of generator table entries (supports batch up to 2^TABLE_BITS)
 const TABLE_BITS: usize = 24;
@@ -42,6 +47,11 @@ struct Args {
     #[arg(long)]
     cuda: bool,
 
+    /// Use experimental CUDA backend that brute-forces real Blocknet BIP39 mnemonics
+    /// (much slower than the existing CUDA path; correctness-first)
+    #[arg(long)]
+    cuda_bip39: bool,
+
     /// GPU batch size (keys per kernel launch) [default: 8388608]
     #[arg(long, default_value = "8388608")]
     batch_size: usize,
@@ -54,6 +64,8 @@ struct Args {
 #[derive(Serialize, Clone)]
 struct VanityWallet {
     address: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seed: Option<String>, // 12-word BIP39 mnemonic
     spend_private_key: String,
     spend_public_key: String,
     view_private_key: String,
@@ -1214,6 +1226,35 @@ trait SearchBackend: Send {
 
 struct CpuBackend;
 
+#[inline]
+fn blocknet_scalar_from_seed32(seed32: &[u8; 32]) -> Scalar {
+    let mut hasher = Sha512::new();
+    hasher.update(BLOCKNET_KEYGEN_TAG);
+    hasher.update(seed32);
+    let hash: [u8; 64] = hasher.finalize().into();
+    Scalar::from_bytes_mod_order_wide(&hash)
+}
+
+#[inline]
+fn blocknet_address_from_pubkeys(spend_pub: &[u8; 32], view_pub: &[u8; 32]) -> String {
+    // Match ../blocknet/wallet/wallet.go: base58(payload64 || checksum4)
+    let mut payload = [0u8; 64];
+    payload[..32].copy_from_slice(spend_pub);
+    payload[32..].copy_from_slice(view_pub);
+
+    let mut h = Sha3_256::new();
+    h.update(BLOCKNET_ADDR_CHECKSUM_TAG.as_bytes());
+    h.update(BLOCKNET_NETWORK_ID.as_bytes());
+    h.update(&payload);
+    let sum = h.finalize();
+
+    let mut combined = [0u8; 68];
+    combined[..64].copy_from_slice(&payload);
+    combined[64..].copy_from_slice(&sum[..4]);
+
+    bs58::encode(&combined).into_string()
+}
+
 impl SearchBackend for CpuBackend {
     fn name(&self) -> &'static str {
         "cpu"
@@ -1333,6 +1374,7 @@ impl SearchBackend for CpuBackend {
                         let spend_priv = base_spend_priv + Scalar::from(offset);
                         let wallet = VanityWallet {
                             address,
+                            seed: None,
                             spend_private_key: hex::encode(spend_priv.as_bytes()),
                             spend_public_key: hex::encode(spend_pub_bytes),
                             view_private_key: hex::encode(view_priv.as_bytes()),
@@ -1397,6 +1439,152 @@ impl CudaBackend {
     }
 }
 
+// ============================================================================
+// CUDA Backend - BIP39 (experimental, correctness-first)
+// ============================================================================
+
+#[allow(dead_code)]
+struct CudaBip39Backend {
+    batch_size: usize,
+}
+
+impl CudaBip39Backend {
+    fn new(batch_size: usize) -> Self {
+        Self { batch_size }
+    }
+}
+
+impl SearchBackend for CudaBip39Backend {
+    fn name(&self) -> &'static str {
+        "cuda-bip39"
+    }
+
+    fn start(
+        &mut self,
+        config: Arc<SearchConfig>,
+        match_tx: mpsc::Sender<VanityWallet>,
+        counter: Arc<AtomicU64>,
+    ) -> Result<(), String> {
+        #[cfg(not(all(feature = "cuda", target_os = "linux")))]
+        {
+            let _ = (config, match_tx, counter);
+            return Err(
+                "CUDA BIP39 backend requires Linux build with --features cuda and nvcc toolchain"
+                    .to_string(),
+            );
+        }
+
+        #[cfg(all(feature = "cuda", target_os = "linux"))]
+        {
+            use bip39::{Language, Mnemonic};
+
+            // Ensure generator table is uploaded, since the kernel uses basepoint from it.
+            let gen_table = build_gen_table();
+            let rc = unsafe { cuda_init_gen_table(gen_table.as_ptr(), TABLE_BITS as i32) };
+            if rc != 0 {
+                return Err(format!("cuda_init_gen_table failed with code {}", rc));
+            }
+
+            let prefix_lower = config.prefix_lower.clone();
+            let suffix_lower = config.suffix_lower.clone();
+
+            // Avoid absurd allocations from the default GPU batch size.
+            // BIP39 brute force is heavy; start small and scale later.
+            let batch_size = self.batch_size.min(65_536).max(256);
+            let pw_stride: usize = 128;
+
+            thread::spawn(move || {
+                let mut rng = rand::thread_rng();
+                let mut pw_buf = vec![0u8; batch_size * pw_stride];
+                let mut pw_lens = vec![0u16; batch_size];
+                let mut flags = vec![0u8; batch_size];
+
+                loop {
+                    for i in 0..batch_size {
+                        let mut entropy = [0u8; 16];
+                        rng.fill_bytes(&mut entropy);
+                        let m = match Mnemonic::from_entropy_in(Language::English, &entropy) {
+                            Ok(m) => m,
+                            Err(_) => continue,
+                        };
+                        let phrase = m.to_string();
+                        let bytes = phrase.as_bytes();
+                        if bytes.len() >= pw_stride {
+                            continue;
+                        }
+                        let base = i * pw_stride;
+                        pw_buf[base..base + pw_stride].fill(0);
+                        pw_buf[base..base + bytes.len()].copy_from_slice(bytes);
+                        pw_lens[i] = bytes.len() as u16;
+                    }
+
+                    let rc = unsafe {
+                        cuda_bip39_match_batch(
+                            pw_buf.as_ptr(),
+                            pw_stride as i32,
+                            pw_lens.as_ptr(),
+                            batch_size as i32,
+                            prefix_lower.as_ptr() as *const i8,
+                            prefix_lower.len() as i32,
+                            suffix_lower.as_ptr() as *const i8,
+                            suffix_lower.len() as i32,
+                            flags.as_mut_ptr(),
+                        )
+                    };
+                    if rc != 0 {
+                        eprintln!("cuda_bip39_match_batch failed rc={}", rc);
+                        return;
+                    }
+
+                    for i in 0..batch_size {
+                        if flags[i] == 0 {
+                            continue;
+                        }
+                        // Reconstruct wallet on CPU from mnemonic.
+                        let base = i * pw_stride;
+                        let len = pw_lens[i] as usize;
+                        let phrase = match std::str::from_utf8(&pw_buf[base..base + len]) {
+                            Ok(s) => s,
+                            Err(_) => continue,
+                        };
+                        let mnemonic = match Mnemonic::parse_in(Language::English, phrase) {
+                            Ok(m) => m,
+                            Err(_) => continue,
+                        };
+                        let seed = mnemonic.to_seed("");
+                        let spend_seed32: [u8; 32] = seed[0..32].try_into().unwrap();
+                        let view_seed32: [u8; 32] = seed[32..64].try_into().unwrap();
+                        let spend_priv = blocknet_scalar_from_seed32(&spend_seed32);
+                        let view_priv = blocknet_scalar_from_seed32(&view_seed32);
+                        let spend_pub = (&spend_priv * RISTRETTO_BASEPOINT_TABLE).compress();
+                        let view_pub = (&view_priv * RISTRETTO_BASEPOINT_TABLE).compress();
+                        let spend_pub_bytes = spend_pub.to_bytes();
+                        let view_pub_bytes = view_pub.to_bytes();
+                        let address = blocknet_address_from_pubkeys(&spend_pub_bytes, &view_pub_bytes);
+
+                        let wallet = VanityWallet {
+                            address,
+                            seed: Some(phrase.to_string()),
+                            spend_private_key: hex::encode(spend_priv.as_bytes()),
+                            spend_public_key: hex::encode(spend_pub_bytes),
+                            view_private_key: hex::encode(view_priv.as_bytes()),
+                            view_public_key: hex::encode(view_pub_bytes),
+                        };
+
+                        if match_tx.send(wallet).is_err() {
+                            return;
+                        }
+                    }
+
+                    counter.fetch_add(batch_size as u64, Ordering::Relaxed);
+                }
+            });
+
+            Ok(())
+        }
+    }
+}
+
 // FFI declarations for the new CUDA worker API
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 unsafe extern "C" {
@@ -1453,6 +1641,27 @@ unsafe extern "C" {
         start_z: *const u64,
         start_t: *const u64,
         out: *mut u8,
+    ) -> i32;
+
+    // BIP39 PBKDF2-HMAC-SHA512 (2048 rounds, salt="mnemonic")
+    fn cuda_pbkdf2_bip39_seed_batch(
+        passwords: *const u8,
+        pw_stride: i32,
+        pw_lens: *const u16,
+        count: i32,
+        out_seed64: *mut u8,
+    ) -> i32;
+
+    fn cuda_bip39_match_batch(
+        passwords: *const u8,
+        pw_stride: i32,
+        pw_lens: *const u16,
+        count: i32,
+        prefix_lower: *const i8,
+        prefix_len: i32,
+        suffix_lower: *const i8,
+        suffix_len: i32,
+        out_flags: *mut u8,
     ) -> i32;
 }
 
@@ -1728,6 +1937,7 @@ impl SearchBackend for CudaBackend {
 
                             let wallet = VanityWallet {
                                 address,
+                                seed: None,
                                 spend_private_key: hex::encode(match_priv.as_bytes()),
                                 spend_public_key: hex::encode(match_pub_bytes),
                                 view_private_key: hex::encode(view_priv.as_bytes()),
@@ -2006,7 +2216,9 @@ fn main() {
     let pattern_len = config.prefix_lower.len() + config.suffix_lower.len();
     let expected = 35.0_f64.powi(pattern_len as i32);
 
-    let mut backend: Box<dyn SearchBackend> = if args.cuda {
+    let mut backend: Box<dyn SearchBackend> = if args.cuda_bip39 {
+        Box::new(CudaBip39Backend::new(batch_size))
+    } else if args.cuda {
         Box::new(CudaBackend::new(batch_size))
     } else {
         Box::new(CpuBackend)
@@ -2183,6 +2395,7 @@ mod tests {
 
         let wallet = VanityWallet {
             address: "test".into(),
+            seed: None,
             spend_private_key: hex::encode(spend_priv.as_bytes()),
             spend_public_key: hex::encode(spend_pub.as_bytes()),
             view_private_key: hex::encode(view_priv.as_bytes()),
@@ -4116,5 +4329,67 @@ mod tests {
             total_match_count > 0,
             "no suffix matches found across all tested suffixes"
         );
+    }
+
+    #[test]
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
+    fn test_cuda_pbkdf2_bip39_seed_matches_cpu() {
+        // This is a foundational correctness test for the planned CUDA BIP39 backend.
+        // It validates the expensive PBKDF2-HMAC-SHA512 step against the `bip39` crate.
+        use bip39::{Language, Mnemonic};
+
+        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let mnemonic = Mnemonic::parse_in(Language::English, phrase).unwrap();
+        let expected = mnemonic.to_seed("");
+
+        const STRIDE: usize = 128;
+        let mut pw_buf = vec![0u8; STRIDE];
+        pw_buf[..phrase.len()].copy_from_slice(phrase.as_bytes());
+        let pw_len: u16 = phrase.len() as u16;
+
+        let mut out = vec![0u8; 64];
+        let rc = unsafe {
+            cuda_pbkdf2_bip39_seed_batch(
+                pw_buf.as_ptr(),
+                STRIDE as i32,
+                &pw_len as *const u16,
+                1,
+                out.as_mut_ptr(),
+            )
+        };
+        assert_eq!(rc, 0, "cuda_pbkdf2_bip39_seed_batch failed with rc={}", rc);
+        assert_eq!(&out[..], &expected[..], "PBKDF2 seed mismatch");
+    }
+
+    #[test]
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
+    fn test_cuda_bip39_match_batch_smoke() {
+        // Smoke test: ensure the kernel runs and returns a flag for a trivially-empty pattern.
+        // This does not validate performance.
+        const STRIDE: usize = 128;
+        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let mut pw_buf = vec![0u8; STRIDE];
+        pw_buf[..phrase.len()].copy_from_slice(phrase.as_bytes());
+        let pw_len: u16 = phrase.len() as u16;
+
+        let prefix = "";
+        let suffix = "";
+        let mut flags = vec![0u8; 1];
+
+        let rc = unsafe {
+            cuda_bip39_match_batch(
+                pw_buf.as_ptr(),
+                STRIDE as i32,
+                &pw_len as *const u16,
+                1,
+                prefix.as_ptr() as *const i8,
+                prefix.len() as i32,
+                suffix.as_ptr() as *const i8,
+                suffix.len() as i32,
+                flags.as_mut_ptr(),
+            )
+        };
+        assert_eq!(rc, 0, "cuda_bip39_match_batch failed with rc={}", rc);
+        assert_eq!(flags[0], 1, "empty prefix/suffix should always match");
     }
 }

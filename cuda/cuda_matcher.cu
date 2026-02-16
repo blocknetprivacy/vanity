@@ -4,6 +4,863 @@
 #include <string.h>
 
 // ============================================================================
+// BIP39 PBKDF2-HMAC-SHA512 (mnemonic -> 64-byte seed)
+//
+// This is a correctness-first implementation intended as the foundation for a
+// future "BIP39 vanity" CUDA path. It is not optimized yet.
+// ============================================================================
+
+__device__ __forceinline__ uint64_t rotr64(uint64_t x, int n) {
+    return (x >> n) | (x << (64 - n));
+}
+
+__device__ __forceinline__ uint64_t load_be64(const uint8_t* p) {
+    uint64_t v = 0;
+    #pragma unroll
+    for (int i = 0; i < 8; i++) v = (v << 8) | (uint64_t)p[i];
+    return v;
+}
+
+__device__ __forceinline__ void store_be64(uint8_t* p, uint64_t v) {
+    #pragma unroll
+    for (int i = 7; i >= 0; i--) { p[i] = (uint8_t)(v & 0xFF); v >>= 8; }
+}
+
+__device__ __forceinline__ uint64_t sha512_ch(uint64_t x, uint64_t y, uint64_t z) {
+    return (x & y) ^ (~x & z);
+}
+__device__ __forceinline__ uint64_t sha512_maj(uint64_t x, uint64_t y, uint64_t z) {
+    return (x & y) ^ (x & z) ^ (y & z);
+}
+__device__ __forceinline__ uint64_t sha512_bsig0(uint64_t x) {
+    return rotr64(x, 28) ^ rotr64(x, 34) ^ rotr64(x, 39);
+}
+__device__ __forceinline__ uint64_t sha512_bsig1(uint64_t x) {
+    return rotr64(x, 14) ^ rotr64(x, 18) ^ rotr64(x, 41);
+}
+__device__ __forceinline__ uint64_t sha512_ssig0(uint64_t x) {
+    return rotr64(x, 1) ^ rotr64(x, 8) ^ (x >> 7);
+}
+__device__ __forceinline__ uint64_t sha512_ssig1(uint64_t x) {
+    return rotr64(x, 19) ^ rotr64(x, 61) ^ (x >> 6);
+}
+
+__device__ __constant__ uint64_t SHA512_K[80] = {
+    0x428a2f98d728ae22ULL, 0x7137449123ef65cdULL, 0xb5c0fbcfec4d3b2fULL, 0xe9b5dba58189dbbcULL,
+    0x3956c25bf348b538ULL, 0x59f111f1b605d019ULL, 0x923f82a4af194f9bULL, 0xab1c5ed5da6d8118ULL,
+    0xd807aa98a3030242ULL, 0x12835b0145706fbeULL, 0x243185be4ee4b28cULL, 0x550c7dc3d5ffb4e2ULL,
+    0x72be5d74f27b896fULL, 0x80deb1fe3b1696b1ULL, 0x9bdc06a725c71235ULL, 0xc19bf174cf692694ULL,
+    0xe49b69c19ef14ad2ULL, 0xefbe4786384f25e3ULL, 0x0fc19dc68b8cd5b5ULL, 0x240ca1cc77ac9c65ULL,
+    0x2de92c6f592b0275ULL, 0x4a7484aa6ea6e483ULL, 0x5cb0a9dcbd41fbd4ULL, 0x76f988da831153b5ULL,
+    0x983e5152ee66dfabULL, 0xa831c66d2db43210ULL, 0xb00327c898fb213fULL, 0xbf597fc7beef0ee4ULL,
+    0xc6e00bf33da88fc2ULL, 0xd5a79147930aa725ULL, 0x06ca6351e003826fULL, 0x142929670a0e6e70ULL,
+    0x27b70a8546d22ffcULL, 0x2e1b21385c26c926ULL, 0x4d2c6dfc5ac42aedULL, 0x53380d139d95b3dfULL,
+    0x650a73548baf63deULL, 0x766a0abb3c77b2a8ULL, 0x81c2c92e47edaee6ULL, 0x92722c851482353bULL,
+    0xa2bfe8a14cf10364ULL, 0xa81a664bbc423001ULL, 0xc24b8b70d0f89791ULL, 0xc76c51a30654be30ULL,
+    0xd192e819d6ef5218ULL, 0xd69906245565a910ULL, 0xf40e35855771202aULL, 0x106aa07032bbd1b8ULL,
+    0x19a4c116b8d2d0c8ULL, 0x1e376c085141ab53ULL, 0x2748774cdf8eeb99ULL, 0x34b0bcb5e19b48a8ULL,
+    0x391c0cb3c5c95a63ULL, 0x4ed8aa4ae3418acbULL, 0x5b9cca4f7763e373ULL, 0x682e6ff3d6b2b8a3ULL,
+    0x748f82ee5defb2fcULL, 0x78a5636f43172f60ULL, 0x84c87814a1f0ab72ULL, 0x8cc702081a6439ecULL,
+    0x90befffa23631e28ULL, 0xa4506cebde82bde9ULL, 0xbef9a3f7b2c67915ULL, 0xc67178f2e372532bULL,
+    0xca273eceea26619cULL, 0xd186b8c721c0c207ULL, 0xeada7dd6cde0eb1eULL, 0xf57d4f7fee6ed178ULL,
+    0x06f067aa72176fbaULL, 0x0a637dc5a2c898a6ULL, 0x113f9804bef90daeULL, 0x1b710b35131c471bULL,
+    0x28db77f523047d84ULL, 0x32caab7b40c72493ULL, 0x3c9ebe0a15c9bebcULL, 0x431d67c49c100d4cULL,
+    0x4cc5d4becb3e42b6ULL, 0x597f299cfc657e2aULL, 0x5fcb6fab3ad6faecULL, 0x6c44198c4a475817ULL
+};
+
+__device__ void sha512_compress(uint64_t state[8], const uint8_t block[128]) {
+    uint64_t w[80];
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        w[i] = load_be64(&block[i * 8]);
+    }
+    #pragma unroll
+    for (int i = 16; i < 80; i++) {
+        w[i] = sha512_ssig1(w[i - 2]) + w[i - 7] + sha512_ssig0(w[i - 15]) + w[i - 16];
+    }
+
+    uint64_t a = state[0], b = state[1], c = state[2], d = state[3];
+    uint64_t e = state[4], f = state[5], g = state[6], h = state[7];
+
+    #pragma unroll
+    for (int i = 0; i < 80; i++) {
+        uint64_t t1 = h + sha512_bsig1(e) + sha512_ch(e, f, g) + SHA512_K[i] + w[i];
+        uint64_t t2 = sha512_bsig0(a) + sha512_maj(a, b, c);
+        h = g;
+        g = f;
+        f = e;
+        e = d + t1;
+        d = c;
+        c = b;
+        b = a;
+        a = t1 + t2;
+    }
+
+    state[0] += a; state[1] += b; state[2] += c; state[3] += d;
+    state[4] += e; state[5] += f; state[6] += g; state[7] += h;
+}
+
+// sha512(msg) for msg_len <= 256 (two blocks max)
+__device__ void sha512_hash(const uint8_t* msg, int msg_len, uint8_t out[64]) {
+    // Initial hash values
+    uint64_t st[8] = {
+        0x6a09e667f3bcc908ULL, 0xbb67ae8584caa73bULL, 0x3c6ef372fe94f82bULL, 0xa54ff53a5f1d36f1ULL,
+        0x510e527fade682d1ULL, 0x9b05688c2b3e6c1fULL, 0x1f83d9abfb41bd6bULL, 0x5be0cd19137e2179ULL
+    };
+
+    uint8_t block[128];
+
+    // Process full blocks
+    int offset = 0;
+    while (msg_len - offset >= 128) {
+        #pragma unroll
+        for (int i = 0; i < 128; i++) block[i] = msg[offset + i];
+        sha512_compress(st, block);
+        offset += 128;
+    }
+
+    // Final padding block(s)
+    int rem = msg_len - offset;
+    #pragma unroll
+    for (int i = 0; i < 128; i++) block[i] = 0;
+    for (int i = 0; i < rem; i++) block[i] = msg[offset + i];
+    block[rem] = 0x80;
+
+    // 128-bit bitlength; we only support msg_len < 2^32 so high 64 bits are 0.
+    uint64_t bit_len_lo = (uint64_t)msg_len * 8ULL;
+
+    if (rem <= 111) {
+        // Fits length in this block
+        // high 64
+        for (int i = 0; i < 8; i++) block[112 + i] = 0;
+        store_be64(&block[120], bit_len_lo);
+        sha512_compress(st, block);
+    } else {
+        // Need two blocks
+        sha512_compress(st, block);
+        #pragma unroll
+        for (int i = 0; i < 128; i++) block[i] = 0;
+        for (int i = 0; i < 8; i++) block[112 + i] = 0;
+        store_be64(&block[120], bit_len_lo);
+        sha512_compress(st, block);
+    }
+
+    // Output
+    #pragma unroll
+    for (int i = 0; i < 8; i++) store_be64(&out[i * 8], st[i]);
+}
+
+// HMAC-SHA512 with key_len <= 128, msg_len <= 128 (used by PBKDF2 inner messages).
+__device__ void hmac_sha512_smallkey(
+    const uint8_t* key, int key_len,
+    const uint8_t* msg, int msg_len,
+    uint8_t out[64]
+) {
+    uint8_t key_block[128];
+    #pragma unroll
+    for (int i = 0; i < 128; i++) key_block[i] = 0;
+    for (int i = 0; i < key_len; i++) key_block[i] = key[i];
+
+    uint8_t inner_pad[128];
+    uint8_t outer_pad[128];
+    #pragma unroll
+    for (int i = 0; i < 128; i++) {
+        inner_pad[i] = key_block[i] ^ 0x36;
+        outer_pad[i] = key_block[i] ^ 0x5c;
+    }
+
+    // inner = sha512(inner_pad || msg)
+    uint8_t inner_msg[256];
+    int inner_len = 128 + msg_len;
+    #pragma unroll
+    for (int i = 0; i < 128; i++) inner_msg[i] = inner_pad[i];
+    for (int i = 0; i < msg_len; i++) inner_msg[128 + i] = msg[i];
+
+    uint8_t inner_hash[64];
+    sha512_hash(inner_msg, inner_len, inner_hash);
+
+    // outer = sha512(outer_pad || inner_hash)
+    uint8_t outer_msg[256];
+    #pragma unroll
+    for (int i = 0; i < 128; i++) outer_msg[i] = outer_pad[i];
+    #pragma unroll
+    for (int i = 0; i < 64; i++) outer_msg[128 + i] = inner_hash[i];
+
+    sha512_hash(outer_msg, 128 + 64, out);
+}
+
+__global__ void pbkdf2_bip39_kernel(
+    const uint8_t* passwords, int pw_stride,
+    const uint16_t* pw_lens,
+    int count,
+    uint8_t* out_seed64
+) {
+    int tid = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (tid >= count) return;
+
+    const uint8_t* pw = &passwords[tid * pw_stride];
+    int pw_len = (int)pw_lens[tid];
+    if (pw_len <= 0 || pw_len > 128) {
+        // mark invalid by zeroing output
+        for (int i = 0; i < 64; i++) out_seed64[tid * 64 + i] = 0;
+        return;
+    }
+
+    // salt = "mnemonic" + passphrase, with passphrase = "" (Blocknet behavior)
+    const uint8_t salt[] = { 'm','n','e','m','o','n','i','c' };
+
+    // U1 = HMAC(pw, salt || INT_32_BE(1))
+    uint8_t msg1[12];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) msg1[i] = salt[i];
+    msg1[8] = 0; msg1[9] = 0; msg1[10] = 0; msg1[11] = 1;
+
+    uint8_t u[64];
+    hmac_sha512_smallkey(pw, pw_len, msg1, 12, u);
+
+    uint8_t t[64];
+    #pragma unroll
+    for (int i = 0; i < 64; i++) t[i] = u[i];
+
+    // U2..U2048
+    #pragma unroll 1
+    for (int iter = 2; iter <= 2048; iter++) {
+        uint8_t u_next[64];
+        hmac_sha512_smallkey(pw, pw_len, u, 64, u_next);
+        #pragma unroll
+        for (int i = 0; i < 64; i++) {
+            u[i] = u_next[i];
+            t[i] ^= u_next[i];
+        }
+    }
+
+    #pragma unroll
+    for (int i = 0; i < 64; i++) out_seed64[tid * 64 + i] = t[i];
+}
+
+extern "C" int cuda_pbkdf2_bip39_seed_batch(
+    const uint8_t* passwords, int pw_stride,
+    const uint16_t* pw_lens,
+    int count,
+    uint8_t* out_seed64
+) {
+    if (count <= 0) return 0;
+    if (pw_stride <= 0 || pw_stride > 256) return 1;
+    if (!passwords || !pw_lens || !out_seed64) return 2;
+
+    uint8_t* d_pw = nullptr;
+    uint16_t* d_lens = nullptr;
+    uint8_t* d_out = nullptr;
+    int rc = 0;
+
+    size_t pw_bytes = (size_t)count * (size_t)pw_stride;
+    size_t lens_bytes = (size_t)count * sizeof(uint16_t);
+    size_t out_bytes = (size_t)count * 64;
+
+    if (cudaMalloc(&d_pw, pw_bytes) != cudaSuccess) { rc = 10; goto cleanup; }
+    if (cudaMalloc(&d_lens, lens_bytes) != cudaSuccess) { rc = 11; goto cleanup; }
+    if (cudaMalloc(&d_out, out_bytes) != cudaSuccess) { rc = 12; goto cleanup; }
+
+    if (cudaMemcpy(d_pw, passwords, pw_bytes, cudaMemcpyHostToDevice) != cudaSuccess) { rc = 20; goto cleanup; }
+    if (cudaMemcpy(d_lens, pw_lens, lens_bytes, cudaMemcpyHostToDevice) != cudaSuccess) { rc = 21; goto cleanup; }
+
+    int threads = 128;
+    int blocks = (count + threads - 1) / threads;
+    pbkdf2_bip39_kernel<<<blocks, threads>>>(d_pw, pw_stride, d_lens, count, d_out);
+    if (cudaDeviceSynchronize() != cudaSuccess) { rc = 30; goto cleanup; }
+
+    if (cudaMemcpy(out_seed64, d_out, out_bytes, cudaMemcpyDeviceToHost) != cudaSuccess) { rc = 31; goto cleanup; }
+
+cleanup:
+    if (d_pw) cudaFree(d_pw);
+    if (d_lens) cudaFree(d_lens);
+    if (d_out) cudaFree(d_out);
+    return rc;
+}
+
+// ============================================================================
+// Blocknet derivation + address encode + match (correctness-first)
+// ============================================================================
+
+// Curve order l for ed25519/ristretto:
+// l = 2^252 + 27742317777372353535851937790883648493
+//
+// Reduce 64-byte scalar (little-endian) mod l, output in s[0..32) little-endian.
+// This matches the semantics used by curve25519-dalek's Scalar::from_bytes_mod_order_wide.
+// Adapted from ed25519 ref10 (public domain).
+__device__ __forceinline__ int64_t load_3_le(const uint8_t* in) {
+    return (int64_t)in[0] | ((int64_t)in[1] << 8) | ((int64_t)in[2] << 16);
+}
+__device__ __forceinline__ int64_t load_4_le(const uint8_t* in) {
+    return (int64_t)in[0] | ((int64_t)in[1] << 8) | ((int64_t)in[2] << 16) | ((int64_t)in[3] << 24);
+}
+
+__device__ void sc_reduce(uint8_t s[64]) {
+    int64_t s0  = 2097151 & load_3_le(s);
+    int64_t s1  = 2097151 & (load_4_le(s + 2) >> 5);
+    int64_t s2  = 2097151 & (load_3_le(s + 5) >> 2);
+    int64_t s3  = 2097151 & (load_4_le(s + 7) >> 7);
+    int64_t s4  = 2097151 & (load_4_le(s + 10) >> 4);
+    int64_t s5  = 2097151 & (load_3_le(s + 13) >> 1);
+    int64_t s6  = 2097151 & (load_4_le(s + 15) >> 6);
+    int64_t s7  = 2097151 & (load_3_le(s + 18) >> 3);
+    int64_t s8  = 2097151 & load_3_le(s + 21);
+    int64_t s9  = 2097151 & (load_4_le(s + 23) >> 5);
+    int64_t s10 = 2097151 & (load_3_le(s + 26) >> 2);
+    int64_t s11 = 2097151 & (load_4_le(s + 28) >> 7);
+    int64_t s12 = 2097151 & (load_4_le(s + 31) >> 4);
+    int64_t s13 = 2097151 & (load_3_le(s + 34) >> 1);
+    int64_t s14 = 2097151 & (load_4_le(s + 36) >> 6);
+    int64_t s15 = 2097151 & (load_3_le(s + 39) >> 3);
+    int64_t s16 = 2097151 & load_3_le(s + 42);
+    int64_t s17 = 2097151 & (load_4_le(s + 44) >> 5);
+    int64_t s18 = 2097151 & (load_3_le(s + 47) >> 2);
+    int64_t s19 = 2097151 & (load_4_le(s + 49) >> 7);
+    int64_t s20 = 2097151 & (load_4_le(s + 52) >> 4);
+    int64_t s21 = 2097151 & (load_3_le(s + 55) >> 1);
+    int64_t s22 = 2097151 & (load_4_le(s + 57) >> 6);
+    int64_t s23 = (load_4_le(s + 60) >> 3);
+
+    s11 += s23 * 666643;
+    s12 += s23 * 470296;
+    s13 += s23 * 654183;
+    s14 -= s23 * 997805;
+    s15 += s23 * 136657;
+    s16 -= s23 * 683901;
+    s23 = 0;
+
+    s10 += s22 * 666643;
+    s11 += s22 * 470296;
+    s12 += s22 * 654183;
+    s13 -= s22 * 997805;
+    s14 += s22 * 136657;
+    s15 -= s22 * 683901;
+    s22 = 0;
+
+    s9 += s21 * 666643;
+    s10 += s21 * 470296;
+    s11 += s21 * 654183;
+    s12 -= s21 * 997805;
+    s13 += s21 * 136657;
+    s14 -= s21 * 683901;
+    s21 = 0;
+
+    s8 += s20 * 666643;
+    s9 += s20 * 470296;
+    s10 += s20 * 654183;
+    s11 -= s20 * 997805;
+    s12 += s20 * 136657;
+    s13 -= s20 * 683901;
+    s20 = 0;
+
+    s7 += s19 * 666643;
+    s8 += s19 * 470296;
+    s9 += s19 * 654183;
+    s10 -= s19 * 997805;
+    s11 += s19 * 136657;
+    s12 -= s19 * 683901;
+    s19 = 0;
+
+    s6 += s18 * 666643;
+    s7 += s18 * 470296;
+    s8 += s18 * 654183;
+    s9 -= s18 * 997805;
+    s10 += s18 * 136657;
+    s11 -= s18 * 683901;
+    s18 = 0;
+
+    int64_t carry0  = (s0  + (1LL << 20)) >> 21; s1  += carry0;  s0  -= carry0  << 21;
+    int64_t carry1  = (s1  + (1LL << 20)) >> 21; s2  += carry1;  s1  -= carry1  << 21;
+    int64_t carry2  = (s2  + (1LL << 20)) >> 21; s3  += carry2;  s2  -= carry2  << 21;
+    int64_t carry3  = (s3  + (1LL << 20)) >> 21; s4  += carry3;  s3  -= carry3  << 21;
+    int64_t carry4  = (s4  + (1LL << 20)) >> 21; s5  += carry4;  s4  -= carry4  << 21;
+    int64_t carry5  = (s5  + (1LL << 20)) >> 21; s6  += carry5;  s5  -= carry5  << 21;
+    int64_t carry6  = (s6  + (1LL << 20)) >> 21; s7  += carry6;  s6  -= carry6  << 21;
+    int64_t carry7  = (s7  + (1LL << 20)) >> 21; s8  += carry7;  s7  -= carry7  << 21;
+    int64_t carry8  = (s8  + (1LL << 20)) >> 21; s9  += carry8;  s8  -= carry8  << 21;
+    int64_t carry9  = (s9  + (1LL << 20)) >> 21; s10 += carry9;  s9  -= carry9  << 21;
+    int64_t carry10 = (s10 + (1LL << 20)) >> 21; s11 += carry10; s10 -= carry10 << 21;
+    int64_t carry11 = (s11 + (1LL << 20)) >> 21; s12 += carry11; s11 -= carry11 << 21;
+    int64_t carry12 = (s12 + (1LL << 20)) >> 21; s13 += carry12; s12 -= carry12 << 21;
+    int64_t carry13 = (s13 + (1LL << 20)) >> 21; s14 += carry13; s13 -= carry13 << 21;
+    int64_t carry14 = (s14 + (1LL << 20)) >> 21; s15 += carry14; s14 -= carry14 << 21;
+    int64_t carry15 = (s15 + (1LL << 20)) >> 21; s16 += carry15; s15 -= carry15 << 21;
+
+    s5 += s17 * 666643;
+    s6 += s17 * 470296;
+    s7 += s17 * 654183;
+    s8 -= s17 * 997805;
+    s9 += s17 * 136657;
+    s10 -= s17 * 683901;
+    s17 = 0;
+
+    s4 += s16 * 666643;
+    s5 += s16 * 470296;
+    s6 += s16 * 654183;
+    s7 -= s16 * 997805;
+    s8 += s16 * 136657;
+    s9 -= s16 * 683901;
+    s16 = 0;
+
+    s3 += s15 * 666643;
+    s4 += s15 * 470296;
+    s5 += s15 * 654183;
+    s6 -= s15 * 997805;
+    s7 += s15 * 136657;
+    s8 -= s15 * 683901;
+    s15 = 0;
+
+    s2 += s14 * 666643;
+    s3 += s14 * 470296;
+    s4 += s14 * 654183;
+    s5 -= s14 * 997805;
+    s6 += s14 * 136657;
+    s7 -= s14 * 683901;
+    s14 = 0;
+
+    s1 += s13 * 666643;
+    s2 += s13 * 470296;
+    s3 += s13 * 654183;
+    s4 -= s13 * 997805;
+    s5 += s13 * 136657;
+    s6 -= s13 * 683901;
+    s13 = 0;
+
+    s0 += s12 * 666643;
+    s1 += s12 * 470296;
+    s2 += s12 * 654183;
+    s3 -= s12 * 997805;
+    s4 += s12 * 136657;
+    s5 -= s12 * 683901;
+    s12 = 0;
+
+    carry0  = (s0  + (1LL << 20)) >> 21; s1  += carry0;  s0  -= carry0  << 21;
+    carry1  = (s1  + (1LL << 20)) >> 21; s2  += carry1;  s1  -= carry1  << 21;
+    carry2  = (s2  + (1LL << 20)) >> 21; s3  += carry2;  s2  -= carry2  << 21;
+    carry3  = (s3  + (1LL << 20)) >> 21; s4  += carry3;  s3  -= carry3  << 21;
+    carry4  = (s4  + (1LL << 20)) >> 21; s5  += carry4;  s4  -= carry4  << 21;
+    carry5  = (s5  + (1LL << 20)) >> 21; s6  += carry5;  s5  -= carry5  << 21;
+    carry6  = (s6  + (1LL << 20)) >> 21; s7  += carry6;  s6  -= carry6  << 21;
+    carry7  = (s7  + (1LL << 20)) >> 21; s8  += carry7;  s7  -= carry7  << 21;
+    carry8  = (s8  + (1LL << 20)) >> 21; s9  += carry8;  s8  -= carry8  << 21;
+    carry9  = (s9  + (1LL << 20)) >> 21; s10 += carry9;  s9  -= carry9  << 21;
+    carry10 = (s10 + (1LL << 20)) >> 21; s11 += carry10; s10 -= carry10 << 21;
+    carry11 = (s11 + (1LL << 20)) >> 21; s12 += carry11; s11 -= carry11 << 21;
+
+    // Store 32-byte little-endian scalar
+    s[0]  = (uint8_t)(s0 >> 0);
+    s[1]  = (uint8_t)(s0 >> 8);
+    s[2]  = (uint8_t)((s0 >> 16) | (s1 << 5));
+    s[3]  = (uint8_t)(s1 >> 3);
+    s[4]  = (uint8_t)(s1 >> 11);
+    s[5]  = (uint8_t)((s1 >> 19) | (s2 << 2));
+    s[6]  = (uint8_t)(s2 >> 6);
+    s[7]  = (uint8_t)((s2 >> 14) | (s3 << 7));
+    s[8]  = (uint8_t)(s3 >> 1);
+    s[9]  = (uint8_t)(s3 >> 9);
+    s[10] = (uint8_t)((s3 >> 17) | (s4 << 4));
+    s[11] = (uint8_t)(s4 >> 4);
+    s[12] = (uint8_t)(s4 >> 12);
+    s[13] = (uint8_t)((s4 >> 20) | (s5 << 1));
+    s[14] = (uint8_t)(s5 >> 7);
+    s[15] = (uint8_t)((s5 >> 15) | (s6 << 6));
+    s[16] = (uint8_t)(s6 >> 2);
+    s[17] = (uint8_t)(s6 >> 10);
+    s[18] = (uint8_t)((s6 >> 18) | (s7 << 3));
+    s[19] = (uint8_t)(s7 >> 5);
+    s[20] = (uint8_t)(s7 >> 13);
+    s[21] = (uint8_t)(s8 >> 0);
+    s[22] = (uint8_t)(s8 >> 8);
+    s[23] = (uint8_t)((s8 >> 16) | (s9 << 5));
+    s[24] = (uint8_t)(s9 >> 3);
+    s[25] = (uint8_t)(s9 >> 11);
+    s[26] = (uint8_t)((s9 >> 19) | (s10 << 2));
+    s[27] = (uint8_t)(s10 >> 6);
+    s[28] = (uint8_t)((s10 >> 14) | (s11 << 7));
+    s[29] = (uint8_t)(s11 >> 1);
+    s[30] = (uint8_t)(s11 >> 9);
+    s[31] = (uint8_t)(s11 >> 17);
+}
+
+__device__ void ge_double(ge25519_p3* R, const ge25519_p3* P) {
+    // Extended coordinates doubling (ref10 ge_p3_dbl)
+    fe25519 A, B, C, D, E, F, G, H;
+    fe_sq(&A, &P->X);           // A = X^2
+    fe_sq(&B, &P->Y);           // B = Y^2
+    fe_sq(&C, &P->Z);           // C = Z^2
+    fe_add(&C, &C, &C);         // C = 2*Z^2
+    fe_neg(&D, &A);             // D = -A
+    fe25519 t0;
+    fe_add(&t0, &P->X, &P->Y);  // t0 = X+Y
+    fe_sq(&t0, &t0);            // t0 = (X+Y)^2
+    fe_sub(&E, &t0, &A);        // E = (X+Y)^2 - A
+    fe_sub(&E, &E, &B);         // E = (X+Y)^2 - A - B
+    fe_add(&G, &D, &B);         // G = D + B
+    fe_sub(&F, &G, &C);         // F = G - C
+    fe_sub(&H, &D, &B);         // H = D - B
+    fe_mul(&R->X, &E, &F);
+    fe_mul(&R->Y, &G, &H);
+    fe_mul(&R->Z, &F, &G);
+    fe_mul(&R->T, &E, &H);
+}
+
+__device__ void ge_scalarmult_basepoint(ge25519_p3* out, const uint8_t scalar_le[32]) {
+    // Very slow double-and-add; correctness-first.
+    ge25519_p3 acc;
+    ge_identity(&acc);
+
+    // basepoint is table[0] (G) as uploaded by cuda_init_gen_table
+    ge25519_p3 cur = d_gen_table[0];
+
+    for (int bit = 0; bit < 256; bit++) {
+        int byte = bit >> 3;
+        int b = (scalar_le[byte] >> (bit & 7)) & 1;
+        if (b) {
+            ge25519_p3 tmp;
+            ge_add(&tmp, &acc, &cur);
+            acc = tmp;
+        }
+        ge25519_p3 dbl;
+        ge_double(&dbl, &cur);
+        cur = dbl;
+    }
+
+    *out = acc;
+}
+
+// Minimal Keccak-f[1600] and SHA3-256 (rate=136, capacity=64)
+__device__ __forceinline__ uint64_t rol64(uint64_t x, int n) {
+    return (x << n) | (x >> (64 - n));
+}
+
+__device__ void keccak_f1600(uint64_t st[25]) {
+    const uint64_t RC[24] = {
+        0x0000000000000001ULL, 0x0000000000008082ULL, 0x800000000000808aULL, 0x8000000080008000ULL,
+        0x000000000000808bULL, 0x0000000080000001ULL, 0x8000000080008081ULL, 0x8000000000008009ULL,
+        0x000000000000008aULL, 0x0000000000000088ULL, 0x0000000080008009ULL, 0x000000008000000aULL,
+        0x000000008000808bULL, 0x800000000000008bULL, 0x8000000000008089ULL, 0x8000000000008003ULL,
+        0x8000000000008002ULL, 0x8000000000000080ULL, 0x000000000000800aULL, 0x800000008000000aULL,
+        0x8000000080008081ULL, 0x8000000000008080ULL, 0x0000000080000001ULL, 0x8000000080008008ULL
+    };
+    const int r[25] = {
+        0, 1, 62, 28, 27,
+        36, 44, 6, 55, 20,
+        3, 10, 43, 25, 39,
+        41, 45, 15, 21, 8,
+        18, 2, 61, 56, 14
+    };
+    const int pi[25] = {
+        0, 10, 20, 5, 15,
+        16, 1, 11, 21, 6,
+        7, 17, 2, 12, 22,
+        23, 8, 18, 3, 13,
+        14, 24, 9, 19, 4
+    };
+    for (int round = 0; round < 24; round++) {
+        uint64_t C[5], D[5];
+        #pragma unroll
+        for (int x = 0; x < 5; x++) {
+            C[x] = st[x] ^ st[x + 5] ^ st[x + 10] ^ st[x + 15] ^ st[x + 20];
+        }
+        #pragma unroll
+        for (int x = 0; x < 5; x++) {
+            D[x] = C[(x + 4) % 5] ^ rol64(C[(x + 1) % 5], 1);
+        }
+        #pragma unroll
+        for (int i = 0; i < 25; i++) {
+            st[i] ^= D[i % 5];
+        }
+
+        uint64_t B[25];
+        #pragma unroll
+        for (int i = 0; i < 25; i++) {
+            B[pi[i]] = rol64(st[i], r[i]);
+        }
+
+        #pragma unroll
+        for (int y = 0; y < 5; y++) {
+            #pragma unroll
+            for (int x = 0; x < 5; x++) {
+                st[x + 5 * y] = B[x + 5 * y] ^ ((~B[((x + 1) % 5) + 5 * y]) & B[((x + 2) % 5) + 5 * y]);
+            }
+        }
+
+        st[0] ^= RC[round];
+    }
+}
+
+__device__ void sha3_256(const uint8_t* msg, int msg_len, uint8_t out[32]) {
+    uint64_t st[25];
+    #pragma unroll
+    for (int i = 0; i < 25; i++) st[i] = 0;
+
+    const int rate = 136;
+    int offset = 0;
+    while (msg_len - offset >= rate) {
+        // absorb full rate
+        for (int i = 0; i < rate / 8; i++) {
+            uint64_t lane = 0;
+            #pragma unroll
+            for (int b = 0; b < 8; b++) lane |= ((uint64_t)msg[offset + i * 8 + b]) << (8 * b);
+            st[i] ^= lane;
+        }
+        keccak_f1600(st);
+        offset += rate;
+    }
+
+    uint8_t block[rate];
+    for (int i = 0; i < rate; i++) block[i] = 0;
+    int rem = msg_len - offset;
+    for (int i = 0; i < rem; i++) block[i] = msg[offset + i];
+    block[rem] ^= 0x06;          // domain separation for SHA3
+    block[rate - 1] ^= 0x80;     // padding
+
+    for (int i = 0; i < rate / 8; i++) {
+        uint64_t lane = 0;
+        #pragma unroll
+        for (int b = 0; b < 8; b++) lane |= ((uint64_t)block[i * 8 + b]) << (8 * b);
+        st[i] ^= lane;
+    }
+    keccak_f1600(st);
+
+    // squeeze 32 bytes
+    for (int i = 0; i < 4; i++) {
+        uint64_t lane = st[i];
+        #pragma unroll
+        for (int b = 0; b < 8; b++) out[i * 8 + b] = (uint8_t)((lane >> (8 * b)) & 0xFF);
+    }
+}
+
+// Base58 encode (bitcoin alphabet) - simple big-int division implementation.
+__device__ int base58_encode(const uint8_t* in, int in_len, char* out, int out_cap) {
+    const char* ALPH = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    // Count leading zeroes
+    int zeros = 0;
+    while (zeros < in_len && in[zeros] == 0) zeros++;
+
+    // Copy input since we'll modify via division
+    uint8_t tmp[80];
+    if (in_len > (int)sizeof(tmp)) return -1;
+    for (int i = 0; i < in_len; i++) tmp[i] = in[i];
+
+    char buf[128];
+    int buf_len = 0;
+
+    int start = zeros;
+    while (start < in_len) {
+        int carry = 0;
+        for (int i = start; i < in_len; i++) {
+            int v = (int)tmp[i] + (carry << 8);
+            tmp[i] = (uint8_t)(v / 58);
+            carry = v % 58;
+        }
+        buf[buf_len++] = ALPH[carry];
+        while (start < in_len && tmp[start] == 0) start++;
+        if (buf_len >= (int)sizeof(buf)) return -2;
+    }
+
+    // Add leading '1' for zeros
+    int out_len = 0;
+    for (int i = 0; i < zeros; i++) {
+        if (out_len >= out_cap) return -3;
+        out[out_len++] = '1';
+    }
+    // Reverse digits
+    for (int i = buf_len - 1; i >= 0; i--) {
+        if (out_len >= out_cap) return -4;
+        out[out_len++] = buf[i];
+    }
+    if (out_len < out_cap) out[out_len] = 0;
+    return out_len;
+}
+
+__device__ __forceinline__ int ascii_lower_eq(char a, char b_lower) {
+    char al = (a >= 'A' && a <= 'Z') ? (char)(a + 32) : a;
+    return al == b_lower;
+}
+
+__device__ int match_prefix_suffix_case_insensitive(
+    const char* s, int s_len,
+    const char* prefix_lower, int prefix_len,
+    const char* suffix_lower, int suffix_len
+) {
+    if (prefix_len > s_len || suffix_len > s_len) return 0;
+    for (int i = 0; i < prefix_len; i++) {
+        if (!ascii_lower_eq(s[i], prefix_lower[i])) return 0;
+    }
+    for (int i = 0; i < suffix_len; i++) {
+        if (!ascii_lower_eq(s[s_len - suffix_len + i], suffix_lower[i])) return 0;
+    }
+    return 1;
+}
+
+__global__ void bip39_match_kernel(
+    const uint8_t* passwords, int pw_stride,
+    const uint16_t* pw_lens,
+    int count,
+    const char* prefix_lower, int prefix_len,
+    const char* suffix_lower, int suffix_len,
+    uint8_t* out_flags
+) {
+    int tid = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (tid >= count) return;
+
+    const uint8_t* pw = &passwords[tid * pw_stride];
+    int pw_len = (int)pw_lens[tid];
+    if (pw_len <= 0 || pw_len > 128) {
+        out_flags[tid] = 0;
+        return;
+    }
+
+    // PBKDF2 to get BIP39 seed
+    const uint8_t salt[] = { 'm','n','e','m','o','n','i','c' };
+    uint8_t msg1[12];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) msg1[i] = salt[i];
+    msg1[8] = 0; msg1[9] = 0; msg1[10] = 0; msg1[11] = 1;
+
+    uint8_t u[64];
+    hmac_sha512_smallkey(pw, pw_len, msg1, 12, u);
+    uint8_t t[64];
+    #pragma unroll
+    for (int i = 0; i < 64; i++) t[i] = u[i];
+    #pragma unroll 1
+    for (int iter = 2; iter <= 2048; iter++) {
+        uint8_t u_next[64];
+        hmac_sha512_smallkey(pw, pw_len, u, 64, u_next);
+        #pragma unroll
+        for (int i = 0; i < 64; i++) { u[i] = u_next[i]; t[i] ^= u_next[i]; }
+    }
+
+    // Derive spend/view scalars:
+    // hash = SHA512("blocknet_keygen" || seed32), then Scalar::from_bytes_mod_order_wide(hash).
+    const uint8_t tag[] = { 'b','l','o','c','k','n','e','t','_','k','e','y','g','e','n' };
+
+    uint8_t msg_spend[15 + 32];
+    #pragma unroll
+    for (int i = 0; i < 15; i++) msg_spend[i] = tag[i];
+    #pragma unroll
+    for (int i = 0; i < 32; i++) msg_spend[15 + i] = t[i];
+    uint8_t spend_hash[64];
+    sha512_hash(msg_spend, 47, spend_hash);
+    sc_reduce(spend_hash); // spend_hash[0..32) little-endian reduced scalar
+
+    uint8_t msg_view[15 + 32];
+    #pragma unroll
+    for (int i = 0; i < 15; i++) msg_view[i] = tag[i];
+    #pragma unroll
+    for (int i = 0; i < 32; i++) msg_view[15 + i] = t[32 + i];
+    uint8_t view_hash[64];
+    sha512_hash(msg_view, 47, view_hash);
+    sc_reduce(view_hash);
+
+    // pubkeys: ristretto_encode(scalar * G)
+    ge25519_p3 spend_point;
+    ge_scalarmult_basepoint(&spend_point, spend_hash);
+    uint8_t spend_pub[32];
+    ristretto_encode(spend_pub, &spend_point);
+
+    ge25519_p3 view_point;
+    ge_scalarmult_basepoint(&view_point, view_hash);
+    uint8_t view_pub[32];
+    ristretto_encode(view_pub, &view_point);
+
+    // payload = spend_pub || view_pub
+    uint8_t payload[64];
+    #pragma unroll
+    for (int i = 0; i < 32; i++) payload[i] = spend_pub[i];
+    #pragma unroll
+    for (int i = 0; i < 32; i++) payload[32 + i] = view_pub[i];
+
+    // checksum = sha3_256(tag || network_id || payload), take first 4 bytes
+    const char* ctag = "blocknet_stealth_address_checksum";
+    const char* net = "blocknet_mainnet";
+    uint8_t chk_msg[32 + 32 + 64]; // enough
+    int pos = 0;
+    for (int i = 0; ctag[i] != 0; i++) chk_msg[pos++] = (uint8_t)ctag[i];
+    for (int i = 0; net[i] != 0; i++) chk_msg[pos++] = (uint8_t)net[i];
+    #pragma unroll
+    for (int i = 0; i < 64; i++) chk_msg[pos++] = payload[i];
+    uint8_t sum[32];
+    sha3_256(chk_msg, pos, sum);
+
+    uint8_t addr_bytes[68];
+    #pragma unroll
+    for (int i = 0; i < 64; i++) addr_bytes[i] = payload[i];
+    addr_bytes[64] = sum[0];
+    addr_bytes[65] = sum[1];
+    addr_bytes[66] = sum[2];
+    addr_bytes[67] = sum[3];
+
+    char addr_b58[128];
+    int addr_len = base58_encode(addr_bytes, 68, addr_b58, (int)sizeof(addr_b58));
+    if (addr_len < 0) {
+        out_flags[tid] = 0;
+        return;
+    }
+
+    int ok = match_prefix_suffix_case_insensitive(
+        addr_b58, addr_len,
+        prefix_lower, prefix_len,
+        suffix_lower, suffix_len
+    );
+    out_flags[tid] = ok ? 1 : 0;
+}
+
+extern "C" int cuda_bip39_match_batch(
+    const uint8_t* passwords, int pw_stride,
+    const uint16_t* pw_lens,
+    int count,
+    const char* prefix_lower, int prefix_len,
+    const char* suffix_lower, int suffix_len,
+    uint8_t* out_flags
+) {
+    if (count <= 0) return 0;
+    if (!passwords || !pw_lens || !out_flags) return 1;
+
+    uint8_t* d_pw = nullptr;
+    uint16_t* d_lens = nullptr;
+    uint8_t* d_flags = nullptr;
+    char* d_prefix = nullptr;
+    char* d_suffix = nullptr;
+    int rc = 0;
+
+    size_t pw_bytes = (size_t)count * (size_t)pw_stride;
+    size_t lens_bytes = (size_t)count * sizeof(uint16_t);
+    size_t flags_bytes = (size_t)count;
+
+    if (cudaMalloc(&d_pw, pw_bytes) != cudaSuccess) { rc = 10; goto cleanup; }
+    if (cudaMalloc(&d_lens, lens_bytes) != cudaSuccess) { rc = 11; goto cleanup; }
+    if (cudaMalloc(&d_flags, flags_bytes) != cudaSuccess) { rc = 12; goto cleanup; }
+    if (cudaMalloc(&d_prefix, prefix_len > 0 ? (size_t)prefix_len : 1) != cudaSuccess) { rc = 13; goto cleanup; }
+    if (cudaMalloc(&d_suffix, suffix_len > 0 ? (size_t)suffix_len : 1) != cudaSuccess) { rc = 14; goto cleanup; }
+
+    if (cudaMemcpy(d_pw, passwords, pw_bytes, cudaMemcpyHostToDevice) != cudaSuccess) { rc = 20; goto cleanup; }
+    if (cudaMemcpy(d_lens, pw_lens, lens_bytes, cudaMemcpyHostToDevice) != cudaSuccess) { rc = 21; goto cleanup; }
+    if (prefix_len > 0 && cudaMemcpy(d_prefix, prefix_lower, (size_t)prefix_len, cudaMemcpyHostToDevice) != cudaSuccess) { rc = 22; goto cleanup; }
+    if (suffix_len > 0 && cudaMemcpy(d_suffix, suffix_lower, (size_t)suffix_len, cudaMemcpyHostToDevice) != cudaSuccess) { rc = 23; goto cleanup; }
+
+    int threads = 128;
+    int blocks = (count + threads - 1) / threads;
+    bip39_match_kernel<<<blocks, threads>>>(
+        d_pw, pw_stride, d_lens, count,
+        d_prefix, prefix_len,
+        d_suffix, suffix_len,
+        d_flags
+    );
+    if (cudaDeviceSynchronize() != cudaSuccess) { rc = 30; goto cleanup; }
+    if (cudaMemcpy(out_flags, d_flags, flags_bytes, cudaMemcpyDeviceToHost) != cudaSuccess) { rc = 31; goto cleanup; }
+
+cleanup:
+    if (d_pw) cudaFree(d_pw);
+    if (d_lens) cudaFree(d_lens);
+    if (d_flags) cudaFree(d_flags);
+    if (d_prefix) cudaFree(d_prefix);
+    if (d_suffix) cudaFree(d_suffix);
+    return rc;
+}
+
+// ============================================================================
 // Field arithmetic for GF(2^255-19) using radix-2^51 representation
 // 5 limbs, each up to 51 bits (with lazy reduction allowing temporary overflow)
 // ============================================================================
