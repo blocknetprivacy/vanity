@@ -1,6 +1,7 @@
 #include <cuda_runtime.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 // ============================================================================
 // Field arithmetic for GF(2^255-19) using radix-2^51 representation
@@ -675,7 +676,15 @@ __device__ __forceinline__ int cmp_combined_split_to_bound(
     return 0;
 }
 
-__global__ void __launch_bounds__(256, 2) vanity_kernel(
+#ifndef VANITY_PREFIX_LAUNCH_MIN_BLOCKS
+#define VANITY_PREFIX_LAUNCH_MIN_BLOCKS 1
+#endif
+
+#ifndef VANITY_GENERIC_LAUNCH_MIN_BLOCKS
+#define VANITY_GENERIC_LAUNCH_MIN_BLOCKS 2
+#endif
+
+__global__ void __launch_bounds__(256, VANITY_GENERIC_LAUNCH_MIN_BLOCKS) vanity_kernel(
     // Starting point P (in extended Edwards coordinates, as 5 u64 limbs each)
     const u64* start_X, const u64* start_Y, const u64* start_Z, const u64* start_T,
     // View public key (compressed, 32 bytes) - constant across batch
@@ -683,7 +692,7 @@ __global__ void __launch_bounds__(256, 2) vanity_kernel(
     // Range-based matching (replaces base58 encoding)
     const uint8_t* prefix_ranges, int num_prefix_ranges,
     u64 suffix_modulus, const u64* suffix_targets, int num_suffix_targets,
-    u64 suffix_shift_mod, u64 suffix_view_offset,
+    u64 suffix_shift_mod, u64 suffix_chunk_mul, u64 suffix_view_offset,
     // Batch: total number of keys (must be multiple of KEYS_PER_THREAD)
     int batch_size,
     // Output: flags (1=match, 0=no match), indexed by key_index [0..batch_size)
@@ -775,8 +784,13 @@ __global__ void __launch_bounds__(256, 2) vanity_kernel(
             // Half-length loop: only spend_pub (32 bytes), precomputed view_pub contribution
             // combined mod m = (spend_mod * shift_mod + view_offset) mod m
             u64 spend_mod = 0;
-            for (int i = 0; i < 32; i++) {
-                spend_mod = (spend_mod * 256 + spend_pub[i]) % suffix_modulus;
+            for (int chunk_idx = 0; chunk_idx < 4; ++chunk_idx) {
+                u64 chunk = 0;
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    chunk = (chunk << 8) | spend_pub[chunk_idx * 8 + j];
+                }
+                spend_mod = (u64)(((u128)spend_mod * suffix_chunk_mul + chunk) % suffix_modulus);
             }
             // Keep the multiply in 128-bit to support suffix lengths up to 8 safely.
             u64 mod_val = (u64)(((u128)spend_mod * suffix_shift_mod + suffix_view_offset) % suffix_modulus);
@@ -801,6 +815,83 @@ __global__ void __launch_bounds__(256, 2) vanity_kernel(
     }
 }
 
+__global__ void __launch_bounds__(256, VANITY_PREFIX_LAUNCH_MIN_BLOCKS) vanity_kernel_prefix(
+    const u64* start_X, const u64* start_Y, const u64* start_Z, const u64* start_T,
+    const uint8_t* view_pub,
+    const uint8_t* prefix_ranges, int num_prefix_ranges,
+    int batch_size,
+    uint8_t* out_flags
+) {
+    int tid = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int num_threads = batch_size >> KPT_SHIFT;
+
+    __shared__ ge25519_p3 s_gen_table[TABLE_SIZE];
+    {
+        int total_u64s = TABLE_SIZE * 20;
+        const u64* src = (const u64*)d_gen_table;
+        u64* dst = (u64*)s_gen_table;
+        for (int i = threadIdx.x; i < total_u64s; i += blockDim.x) {
+            dst[i] = src[i];
+        }
+        __syncthreads();
+    }
+
+    if (tid >= num_threads) return;
+    int key_base = tid << KPT_SHIFT;
+
+    ge25519_p3 point;
+    #pragma unroll
+    for (int i = 0; i < 5; i++) {
+        point.X.v[i] = start_X[i];
+        point.Y.v[i] = start_Y[i];
+        point.Z.v[i] = start_Z[i];
+        point.T.v[i] = start_T[i];
+    }
+
+    for (int bit = KPT_SHIFT; bit < TABLE_SIZE; bit++) {
+        if ((key_base >> bit) & 1) {
+            ge25519_p3 tmp;
+            ge_add(&tmp, &point, &s_gen_table[bit]);
+            point = tmp;
+        }
+    }
+
+    for (int k = 0; k < KEYS_PER_THREAD; k++) {
+        int key_index = key_base + k;
+        if (k > 0) {
+            ge25519_p3 tmp;
+            ge_add(&tmp, &point, &s_gen_table[0]);
+            point = tmp;
+        }
+
+        uint8_t spend_pub[32];
+        ristretto_encode(spend_pub, &point);
+
+        bool prefix_ok = false;
+        int left = 0;
+        int right = num_prefix_ranges;
+        while (left < right) {
+            int mid = left + ((right - left) >> 1);
+            const uint8_t* lo = prefix_ranges + mid * 128;
+            int cmp_lo = cmp_combined_split_to_bound(spend_pub, view_pub, lo);
+            if (cmp_lo < 0) {
+                right = mid;
+                continue;
+            }
+
+            const uint8_t* hi = lo + 64;
+            int cmp_hi = cmp_combined_split_to_bound(spend_pub, view_pub, hi);
+            if (cmp_hi < 0) {
+                prefix_ok = true;
+                break;
+            }
+            left = mid + 1;
+        }
+
+        out_flags[key_index] = prefix_ok ? 1 : 0;
+    }
+}
+
 
 // ============================================================================
 // Host API: Worker lifecycle (persistent memory + per-worker streams)
@@ -813,6 +904,8 @@ struct CudaWorker {
     u64* d_start_Z;
     u64* d_start_T;
     uint8_t* d_view_pub;
+    uint8_t view_pub_cache[32];
+    int view_pub_initialized;
     char* d_prefix;
     char* d_suffix;
     uint8_t* d_flags;
@@ -827,6 +920,7 @@ struct CudaWorker {
     u64* d_suffix_targets;        // array of valid mod targets
     int num_suffix_targets;
     u64 suffix_shift_mod;         // 256^32 mod suffix_modulus (for half-length loop)
+    u64 suffix_chunk_mul;         // 256^8 mod suffix_modulus (for 8-byte chunk loop)
     u64 suffix_view_offset;       // view_pub_as_bigendian mod suffix_modulus
 
     // Legacy mode device memory
@@ -879,6 +973,7 @@ extern "C" void* cuda_worker_create(
     w->d_suffix_targets = nullptr;
     w->num_suffix_targets = 0;
     w->suffix_shift_mod = 0;
+    w->suffix_chunk_mul = 0;
     w->suffix_view_offset = 0;
 
     cudaStreamCreate(&w->stream);
@@ -904,6 +999,8 @@ extern "C" void* cuda_worker_create(
         cudaMalloc(&w->d_start_Z, 5 * sizeof(u64));
         cudaMalloc(&w->d_start_T, 5 * sizeof(u64));
         cudaMalloc(&w->d_view_pub, 32);
+        memset(w->view_pub_cache, 0, sizeof(w->view_pub_cache));
+        w->view_pub_initialized = 0;
         w->d_inputs = nullptr;
     } else {
         // Legacy mode: allocate input buffer
@@ -913,6 +1010,8 @@ extern "C" void* cuda_worker_create(
         w->d_start_Z = nullptr;
         w->d_start_T = nullptr;
         w->d_view_pub = nullptr;
+        memset(w->view_pub_cache, 0, sizeof(w->view_pub_cache));
+        w->view_pub_initialized = 0;
     }
 
     return w;
@@ -925,6 +1024,7 @@ extern "C" int cuda_worker_set_ranges(
     u64 suffix_modulus,
     const u64* suffix_targets, int num_suffix_targets,
     u64 suffix_shift_mod,       // 256^32 mod suffix_modulus
+    u64 suffix_chunk_mul,       // 256^8 mod suffix_modulus
     u64 suffix_view_offset      // view_pub_as_bigendian mod suffix_modulus
 ) {
     CudaWorker* w = (CudaWorker*)handle;
@@ -937,6 +1037,7 @@ extern "C" int cuda_worker_set_ranges(
     w->suffix_modulus = suffix_modulus;
     w->num_suffix_targets = num_suffix_targets;
     w->suffix_shift_mod = suffix_shift_mod;
+    w->suffix_chunk_mul = suffix_chunk_mul;
     w->suffix_view_offset = suffix_view_offset;
 
     // Allocate and copy prefix ranges
@@ -971,6 +1072,7 @@ extern "C" int cuda_worker_submit_v2(
 ) {
     CudaWorker* w = (CudaWorker*)handle;
     if (count > w->max_batch) return 1;
+    if (view_pub == nullptr) return 3;
 
     cudaStream_t s = w->stream;
 
@@ -979,21 +1081,40 @@ extern "C" int cuda_worker_submit_v2(
     cudaMemcpyAsync(w->d_start_Y, start_Y, 5*sizeof(u64), cudaMemcpyHostToDevice, s);
     cudaMemcpyAsync(w->d_start_Z, start_Z, 5*sizeof(u64), cudaMemcpyHostToDevice, s);
     cudaMemcpyAsync(w->d_start_T, start_T, 5*sizeof(u64), cudaMemcpyHostToDevice, s);
-    cudaMemcpyAsync(w->d_view_pub, view_pub, 32, cudaMemcpyHostToDevice, s);
+    // View pub is worker-local and typically constant across all submits.
+    // Avoid a redundant tiny H->D copy every batch unless it changed.
+    if (!w->view_pub_initialized || memcmp(w->view_pub_cache, view_pub, 32) != 0) {
+        memcpy(w->view_pub_cache, view_pub, 32);
+        cudaMemcpyAsync(w->d_view_pub, view_pub, 32, cudaMemcpyHostToDevice, s);
+        w->view_pub_initialized = 1;
+    }
 
     int threads = 256;
     int num_thread_groups = count / KEYS_PER_THREAD;  // count must be multiple of KEYS_PER_THREAD
     int blocks = (num_thread_groups + threads - 1) / threads;
 
-    vanity_kernel<<<blocks, threads, 0, s>>>(
-        w->d_start_X, w->d_start_Y, w->d_start_Z, w->d_start_T,
-        w->d_view_pub,
-        w->d_prefix_ranges, w->num_prefix_ranges,
-        w->suffix_modulus, w->d_suffix_targets, w->num_suffix_targets,
-        w->suffix_shift_mod, w->suffix_view_offset,
-        count,
-        w->d_flags
-    );
+    if (w->num_prefix_ranges > 0 && w->num_suffix_targets == 0) {
+        vanity_kernel_prefix<<<blocks, threads, 0, s>>>(
+            w->d_start_X, w->d_start_Y, w->d_start_Z, w->d_start_T,
+            w->d_view_pub,
+            w->d_prefix_ranges, w->num_prefix_ranges,
+            count,
+            w->d_flags
+        );
+    } else if (w->num_prefix_ranges == 0 && w->num_suffix_targets == 0) {
+        // No prefix and no suffix: every key matches.
+        cudaMemsetAsync(w->d_flags, 1, count, s);
+    } else {
+        vanity_kernel<<<blocks, threads, 0, s>>>(
+            w->d_start_X, w->d_start_Y, w->d_start_Z, w->d_start_T,
+            w->d_view_pub,
+            w->d_prefix_ranges, w->num_prefix_ranges,
+            w->suffix_modulus, w->d_suffix_targets, w->num_suffix_targets,
+            w->suffix_shift_mod, w->suffix_chunk_mul, w->suffix_view_offset,
+            count,
+            w->d_flags
+        );
+    }
 
     // Copy flags to pinned host memory and synchronize
     cudaMemcpyAsync(w->h_flags, w->d_flags, count, cudaMemcpyDeviceToHost, s);
