@@ -14,6 +14,9 @@ fn main() {
         .file("cuda/cuda_matcher.cu")
         .flag("-O3")
         .flag("-lineinfo")
+        .flag("--expt-relaxed-constexpr")
+        .flag("-arch=native")
+        .flag("-Xptxas=-v")
         .compile("cuda_matcher");
 
     println!("cargo:rerun-if-changed=cuda/cuda_matcher.cu");
