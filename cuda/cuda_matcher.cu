@@ -1029,7 +1029,8 @@ __device__ void ge_double(ge25519_p3* R, const ge25519_p3* P) {
 }
 
 // Forward declaration; defined later and filled by cuda_init_gen_table().
-extern __device__ ge25519_p3 d_gen_table[TABLE_SIZE];
+// Unsized to avoid needing TABLE_SIZE at this point.
+extern __device__ ge25519_p3 d_gen_table[];
 
 __device__ void ge_scalarmult_basepoint(ge25519_p3* out, const uint8_t scalar_le[32]) {
     ge25519_p3 acc;
